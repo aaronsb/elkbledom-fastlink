@@ -117,6 +117,7 @@ class BLEDOMInstance:
 
         self._brightness_mode: str = DEFAULT_BRIGHTNESS_MODE
         self._is_melk_og10w = False  # Флаг для специальной модели
+        self._has_warm_white = False  # RGBW devices with dedicated warm white LEDs
 
         self._detect_model()
         asyncio.create_task(self._async_init_state())
@@ -221,6 +222,10 @@ class BLEDOMInstance:
     def color_temp_kelvin(self) -> int:
         return getattr(self, "_color_temp_kelvin", 5000)
 
+    @property
+    def has_warm_white(self) -> bool:
+        return getattr(self, "_has_warm_white", False)
+
     # ---------------------------------------------------------
     # Подключение BLE
     # ---------------------------------------------------------
@@ -242,6 +247,10 @@ class BLEDOMInstance:
                 return
         self._turn_on_cmd = TURN_ON_CMD[0]
         self._turn_off_cmd = TURN_OFF_CMD[0]
+        # Detect RGBW devices with dedicated warm white channel
+        if self._device.name and "BLEDWM" in self._device.name.upper():
+            self._has_warm_white = True
+            LOGGER.info("%s: detected RGBW device with warm white channel", self.name)
 
     async def _ensure_connected(self):
         if self._client and self._client.is_connected:
@@ -307,6 +316,17 @@ class BLEDOMInstance:
         i = max(0, min(int(intensity), 255))
         percent = int(i * 100 / 255)
         await self._write([0x7E, 0x07, 0x05, 0x01, percent, 0xFF, 0x02, 0x01, 0xEF])
+
+    async def set_warm_white(self, brightness: int):
+        """Set dedicated warm white LEDs (ELK-BLEDWM devices with RGBW).
+
+        These devices have a separate warm white (3000K) LED channel
+        activated via mode byte 0x01 (vs 0x03 for RGB). The two modes
+        are exclusive — setting warm white disables RGB and vice versa.
+        """
+        val = max(0, min(int(brightness), 255))
+        await self._write([0x7E, 0x07, 0x05, 0x01, val, 0x00, 0x00, 0x10, 0xEF])
+        self._is_on = val > 0
 
     @retry_bluetooth_connection_error
     async def set_brightness(self, value: int):

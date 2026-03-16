@@ -52,6 +52,11 @@ class BLEDOMLight(LightEntity):
         self._attr_unique_id = f"{self._instance.address}_light"
         self._last_color_mode = ColorMode.RGB
 
+        # Add WHITE color mode for RGBW devices with dedicated warm white LEDs
+        if instance.has_warm_white:
+            self._attr_supported_color_modes = {ColorMode.RGB, ColorMode.COLOR_TEMP, ColorMode.WHITE}
+            _LOGGER.info("%s: RGBW device — enabling WHITE color mode", name)
+
         # Текущее «сырое» имя эффекта (ключ из const), по умолчанию none
         self._current_effect_key: str = "none"
 
@@ -127,6 +132,16 @@ class BLEDOMLight(LightEntity):
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             self._last_color_mode = ColorMode.COLOR_TEMP
             await self._instance.set_color_temp_kelvin(kwargs[ATTR_COLOR_TEMP_KELVIN])
+            self._current_effect_key = "none"
+
+        if ATTR_BRIGHTNESS in kwargs and self._last_color_mode == ColorMode.WHITE:
+            # In WHITE mode, brightness controls the warm white intensity
+            if self._instance.has_warm_white:
+                await self._instance.set_warm_white(kwargs[ATTR_BRIGHTNESS])
+
+        if "white" in kwargs and self._instance.has_warm_white:
+            self._last_color_mode = ColorMode.WHITE
+            await self._instance.set_warm_white(kwargs["white"])
             self._current_effect_key = "none"
 
         if ATTR_EFFECT in kwargs:
