@@ -234,6 +234,11 @@ class BLEDOMInstance:
         await self._ensure_connected()
 
     def _detect_model(self):
+        # Detect RGBW devices with dedicated warm white channel
+        if self._device.name and "BLEDWM" in self._device.name.upper():
+            self._has_warm_white = True
+            LOGGER.info("%s: detected RGBW device with warm white channel", self.name)
+
         for i, name in enumerate(NAME_ARRAY):
             if self._device.name and self._device.name.lower().startswith(name.lower()):
                 self._turn_on_cmd = TURN_ON_CMD[i]
@@ -247,10 +252,6 @@ class BLEDOMInstance:
                 return
         self._turn_on_cmd = TURN_ON_CMD[0]
         self._turn_off_cmd = TURN_OFF_CMD[0]
-        # Detect RGBW devices with dedicated warm white channel
-        if self._device.name and "BLEDWM" in self._device.name.upper():
-            self._has_warm_white = True
-            LOGGER.info("%s: detected RGBW device with warm white channel", self.name)
 
     async def _ensure_connected(self):
         if self._client and self._client.is_connected:
