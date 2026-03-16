@@ -30,10 +30,11 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------
 # BLE-названия и настройки
 # ---------------------------------------------------------
-NAME_ARRAY = ["ELK-BLEDDM", "ELK-BLE", "LEDBLE", "MELK", "ELK-BULB2", "ELK-BULB", "ELK-LAMPL", "MELK-OG10W"]
-WRITE_CHARACTERISTIC_UUIDS = ["0000fff3-0000-1000-8000-00805f9b34fb"] * 8
+NAME_ARRAY = ["ELK-BLEDDM", "ELK-BLEDWM", "ELK-BLE", "LEDBLE", "MELK", "ELK-BULB2", "ELK-BULB", "ELK-LAMPL", "MELK-OG10W"]
+WRITE_CHARACTERISTIC_UUIDS = ["0000fff3-0000-1000-8000-00805f9b34fb"] * 9
 TURN_ON_CMD = [
     [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],  # ELK-BLEDDM
+    [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],  # ELK-BLEDWM (RGBW)
     [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],  # ELK-BLE
     [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],  # LEDBLE
     [0x7E, 0x00, 0x04, 0xF0, 0x00, 0x01, 0xFF, 0x00, 0xEF],  # MELK
@@ -44,6 +45,7 @@ TURN_ON_CMD = [
 ]
 TURN_OFF_CMD = [
     [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF],  # ELK-BLEDDM
+    [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF],  # ELK-BLEDWM (RGBW)
     [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF],  # ELK-BLE
     [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF],  # LEDBLE
     [0x7E, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xEF],  # MELK
@@ -54,8 +56,8 @@ TURN_OFF_CMD = [
 ]
 
 # Реалистичные диапазоны кельвинов для RGB-эмуляции
-MIN_COLOR_TEMPS_K = [1800] * 7 + [1800]
-MAX_COLOR_TEMPS_K = [7000] * 7 + [7000]
+MIN_COLOR_TEMPS_K = [1800] * 8 + [1800]
+MAX_COLOR_TEMPS_K = [7000] * 8 + [7000]
 
 DEFAULT_ATTEMPTS = 3
 BLEAK_BACKOFF_TIME = 0.25
@@ -234,21 +236,18 @@ class BLEDOMInstance:
         await self._ensure_connected()
 
     def _detect_model(self):
-        # Detect RGBW devices with dedicated warm white channel
-        if self._device.name and "BLEDWM" in self._device.name.upper():
-            self._has_warm_white = True
-            LOGGER.info("%s: detected RGBW device with warm white channel", self.name)
-
         for i, name in enumerate(NAME_ARRAY):
             if self._device.name and self._device.name.lower().startswith(name.lower()):
                 self._turn_on_cmd = TURN_ON_CMD[i]
                 self._turn_off_cmd = TURN_OFF_CMD[i]
                 self._min_color_temp_kelvin = MIN_COLOR_TEMPS_K[i]
                 self._max_color_temp_kelvin = MAX_COLOR_TEMPS_K[i]
-                # Проверяем, является ли это моделью MELK-OG10W
                 if name == "MELK-OG10W":
                     self._is_melk_og10w = True
                     LOGGER.info("%s: detected as MELK-OG10W model", self.name)
+                if name == "ELK-BLEDWM":
+                    self._has_warm_white = True
+                    LOGGER.info("%s: detected RGBW device with warm white channel", self.name)
                 return
         self._turn_on_cmd = TURN_ON_CMD[0]
         self._turn_off_cmd = TURN_OFF_CMD[0]
