@@ -21,6 +21,17 @@ from bleak_retry_connector import (
     BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS,
     establish_connection,
 )
+
+try:  # bleak-retry-connector >= 3.x; absent names fall back to "never raised"
+    from bleak_retry_connector import (
+        BleakAbortedError,
+        BleakConnectionError,
+        BleakOutOfConnectionSlotsError,
+    )
+except ImportError:  # pragma: no cover
+    BleakAbortedError = BleakConnectionError = BleakOutOfConnectionSlotsError = type(
+        "_NeverRaised", (Exception,), {}
+    )
 from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.exceptions import ConfigEntryNotReady
 from .const import DEFAULT_BRIGHTNESS_MODE
@@ -71,6 +82,14 @@ RECONNECT_MAX_SECONDS = 300
 CONNECT_ATTEMPTS = 3
 STATE_FILE = "/config/.storage/elkbledom_fastlink_state.json"
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError,)
+# establish_connection has already retried these; retrying them again per
+# write multiplied one command into minutes of connection attempts.
+CONNECTION_EXCEPTIONS = (
+    BleakNotFoundError,
+    BleakConnectionError,
+    BleakOutOfConnectionSlotsError,
+    BleakAbortedError,
+)
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
 # ---------------------------------------------------------
@@ -81,7 +100,7 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
         for attempt in range(DEFAULT_ATTEMPTS):
             try:
                 return await func(self, *args, **kwargs)
-            except BleakNotFoundError:
+            except CONNECTION_EXCEPTIONS:
                 raise
             except RETRY_BACKOFF_EXCEPTIONS as err:
                 if attempt == DEFAULT_ATTEMPTS - 1:
@@ -131,6 +150,7 @@ class BLEDOMInstance:
 
         self._stopping = False
         self._wake = asyncio.Event()
+        self._connected_since: float | None = None
 
         self._detect_model()
         self._tasks: list[asyncio.Task] = [
@@ -198,22 +218,13 @@ class BLEDOMInstance:
     # Режим яркости и переподключение
     # ---------------------------------------------------------
     async def apply_brightness_mode(self, mode: str):
+        """Record the brightness mode and save it, so the instance built by
+        the config-entry reload that follows starts in this mode."""
         mode = (mode or DEFAULT_BRIGHTNESS_MODE).lower()
         if mode not in ("auto", "rgb", "native"):
             mode = DEFAULT_BRIGHTNESS_MODE
-        if mode == self._brightness_mode:
-            return
         self._brightness_mode = mode
         await self._async_save_state()
-        await self.reconnect()
-
-    async def reconnect(self):
-        """Drop the link; the connection loop brings it back."""
-        async with self._connect_lock:
-            await self._disconnect_client()
-        await asyncio.sleep(1.0)
-        self._wake.set()
-        LOGGER.info("%s: reconnecting after mode change (%s)", self.name, self._brightness_mode)
 
     # ---------------------------------------------------------
     # Свойства
@@ -296,12 +307,12 @@ class BLEDOMInstance:
                 self._disconnected,
                 max_attempts=CONNECT_ATTEMPTS,
                 cached_services=self._cached_services,
-                ble_device_callback=self._current_ble_device,
             )
             if self._stopping:
                 await client.disconnect()
                 raise BleakNotFoundError(f"{self.name}: integration is stopping")
             self._client = client
+            self._connected_since = asyncio.get_running_loop().time()
             self._cached_services = client.services
             for ch in WRITE_CHARACTERISTIC_UUIDS:
                 c = client.services.get_characteristic(ch)
@@ -325,19 +336,33 @@ class BLEDOMInstance:
             self._hass.loop.call_soon_threadsafe(self._wake.set)
 
     async def _connection_loop(self):
-        """The only place that reconnects on its own. One per light."""
+        """The only place that reconnects on its own. One per light.
+
+        Each attempt pushes the next allowed attempt out by the current
+        backoff and doubles it. The backoff resets only once a link has
+        stayed up for a full heartbeat, so a link that connects and drops
+        straight away is retried no faster than one that never connects.
+        """
+        loop = asyncio.get_running_loop()
         await asyncio.sleep(INITIAL_CONNECT_DELAY_SECONDS)
         backoff = RECONNECT_MIN_SECONDS
+        not_before = 0.0
         failures = 0
         while not self._stopping:
             self._wake.clear()
-            delay = HEARTBEAT_SECONDS
-            if not self.is_connected:
+            now = loop.time()
+            if self.is_connected:
+                if self._connected_since is not None and now - self._connected_since >= HEARTBEAT_SECONDS:
+                    if failures:
+                        LOGGER.info("%s: link stable again after %d failed attempts", self.name, failures)
+                    failures, backoff = 0, RECONNECT_MIN_SECONDS
+                delay = HEARTBEAT_SECONDS
+            elif now < not_before:
+                delay = not_before - now
+            else:
                 try:
                     await self._ensure_connected()
-                    if failures:
-                        LOGGER.info("%s: reconnected after %d failed attempts", self.name, failures)
-                    failures, backoff = 0, RECONNECT_MIN_SECONDS
+                    delay = HEARTBEAT_SECONDS
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
@@ -346,7 +371,10 @@ class BLEDOMInstance:
                     log("%s: connection failed (attempt %d), retrying in %ds: %s",
                         self.name, failures, backoff, err)
                     delay = backoff
-                    backoff = min(backoff * 2, RECONNECT_MAX_SECONDS)
+                # Counted from the end of the attempt: one attempt can take
+                # longer than the backoff itself.
+                not_before = loop.time() + backoff
+                backoff = min(backoff * 2, RECONNECT_MAX_SECONDS)
             try:
                 await asyncio.wait_for(self._wake.wait(), delay)
             except asyncio.TimeoutError:
@@ -417,6 +445,8 @@ class BLEDOMInstance:
                 try:
                     await write_native_then_rgb()
                     LOGGER.debug("%s: brightness auto→native success (%s%%)", self.name, percent)
+                except CONNECTION_EXCEPTIONS:
+                    raise  # no link: the RGB fallback would fail the same way
                 except Exception as e:
                     LOGGER.warning("%s: native failed (%s), fallback to RGB: %s", self.name, percent, e)
                     await write_rgb_scaled()
@@ -489,5 +519,7 @@ class BLEDOMInstance:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         await self._async_save_state()
-        async with self._connect_lock:
-            await self._disconnect_client()
+        # No lock: waiting here would hold up unload and shutdown behind a
+        # connect in progress, and that connect disconnects itself when it
+        # sees _stopping.
+        await self._disconnect_client()
