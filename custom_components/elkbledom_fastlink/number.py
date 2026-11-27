@@ -45,7 +45,7 @@ class BLEDOMSpeedControl(NumberEntity):
     @property
     def available(self) -> bool:
         """Device is available if BLE client is connected."""
-        return bool(getattr(self._instance, "_client", None) and self._instance._client.is_connected)
+        return self._instance.is_connected
 
     @property
     def native_value(self) -> int:

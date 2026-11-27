@@ -61,13 +61,11 @@ class BLEDOMBrightnessModeSelect(SelectEntity):
         _LOGGER.info("Changing brightness mode to %s for %s", option, self._instance.address)
         self._current_option = option
 
-        # Update HA entry options
+        # Save the mode first: updating the options reloads the config entry,
+        # and the new instance reads its mode from the saved state.
+        await self._instance.apply_brightness_mode(option)
         data = dict(self._entry.options)
         data[CONF_BRIGHTNESS_MODE] = option
         self.hass.config_entries.async_update_entry(self._entry, options=data)
-
-        # Trigger reconnect for mode change
-        await self._instance.stop()
-        await self._instance._ensure_connected()
 
         self.async_write_ha_state()

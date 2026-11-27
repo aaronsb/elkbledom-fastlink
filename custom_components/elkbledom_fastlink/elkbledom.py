@@ -2,6 +2,7 @@ import asyncio
 import logging
 import json
 import os
+import threading
 from typing import Tuple, TypeVar, Callable, cast, Any
 from bleak.backends.service import BleakGATTServiceCollection
 
@@ -21,6 +22,17 @@ from bleak_retry_connector import (
     BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS,
     establish_connection,
 )
+
+try:  # bleak-retry-connector >= 3.x; absent names fall back to "never raised"
+    from bleak_retry_connector import (
+        BleakAbortedError,
+        BleakConnectionError,
+        BleakOutOfConnectionSlotsError,
+    )
+except ImportError:  # pragma: no cover
+    BleakAbortedError = BleakConnectionError = BleakOutOfConnectionSlotsError = type(
+        "_NeverRaised", (Exception,), {}
+    )
 from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.exceptions import ConfigEntryNotReady
 from .const import DEFAULT_BRIGHTNESS_MODE
@@ -61,8 +73,27 @@ MAX_COLOR_TEMPS_K = [7000] * 8 + [7000]
 
 DEFAULT_ATTEMPTS = 3
 BLEAK_BACKOFF_TIME = 0.25
+# One connection loop per light: it keeps the link up, waits HEARTBEAT_SECONDS
+# between checks, and backs off from RECONNECT_MIN_SECONDS to
+# RECONNECT_MAX_SECONDS while the light is unreachable.
+INITIAL_CONNECT_DELAY_SECONDS = 3
+HEARTBEAT_SECONDS = 30
+RECONNECT_MIN_SECONDS = 5
+RECONNECT_MAX_SECONDS = 300
+CONNECT_ATTEMPTS = 3
 STATE_FILE = "/config/.storage/elkbledom_fastlink_state.json"
+# Every light reads, changes and rewrites the one state file from executor
+# threads; without the lock, two saves at once can drop one light's update.
+_STATE_FILE_LOCK = threading.Lock()
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError,)
+# establish_connection has already retried these; retrying them again per
+# write multiplied one command into minutes of connection attempts.
+CONNECTION_EXCEPTIONS = (
+    BleakNotFoundError,
+    BleakConnectionError,
+    BleakOutOfConnectionSlotsError,
+    BleakAbortedError,
+)
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
 # ---------------------------------------------------------
@@ -73,7 +104,7 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
         for attempt in range(DEFAULT_ATTEMPTS):
             try:
                 return await func(self, *args, **kwargs)
-            except BleakNotFoundError:
+            except CONNECTION_EXCEPTIONS:
                 raise
             except RETRY_BACKOFF_EXCEPTIONS as err:
                 if attempt == DEFAULT_ATTEMPTS - 1:
@@ -121,15 +152,26 @@ class BLEDOMInstance:
         self._is_melk_og10w = False  # Флаг для специальной модели
         self._has_warm_white = False  # RGBW devices with dedicated warm white LEDs
 
+        self._stopping = False
+        self._wake = asyncio.Event()
+        self._connected_since: float | None = None
+
         self._detect_model()
-        asyncio.create_task(self._async_init_state())
-        asyncio.create_task(self._delayed_connect())
-        asyncio.create_task(self._heartbeat())
+        self._load_task = hass.async_create_background_task(
+            self._async_init_state(), f"elkbledom_fastlink {address} load state"
+        )
+        self._loop_task = hass.async_create_background_task(
+            self._connection_loop(), f"elkbledom_fastlink {address} connection"
+        )
 
     # ---------------------------------------------------------
     # JSON-состояние (асинхронно)
     # ---------------------------------------------------------
     def _load_state_sync(self):
+        with _STATE_FILE_LOCK:
+            return self._load_state_locked()
+
+    def _load_state_locked(self):
         try:
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
             if os.path.exists(STATE_FILE):
@@ -144,6 +186,10 @@ class BLEDOMInstance:
         return await self._hass.async_add_executor_job(self._load_state_sync)
 
     def _save_state_sync(self, payload: dict | None = None):
+        with _STATE_FILE_LOCK:
+            self._save_state_locked(payload)
+
+    def _save_state_locked(self, payload: dict | None = None):
         try:
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
             data: dict = {}
@@ -182,23 +228,13 @@ class BLEDOMInstance:
     # Режим яркости и переподключение
     # ---------------------------------------------------------
     async def apply_brightness_mode(self, mode: str):
+        """Record the brightness mode and save it, so the instance built by
+        the config-entry reload that follows starts in this mode."""
         mode = (mode or DEFAULT_BRIGHTNESS_MODE).lower()
         if mode not in ("auto", "rgb", "native"):
             mode = DEFAULT_BRIGHTNESS_MODE
-        if mode == self._brightness_mode:
-            return
         self._brightness_mode = mode
         await self._async_save_state()
-        await self.reconnect()
-
-    async def reconnect(self):
-        try:
-            await self.stop()
-        except Exception:
-            pass
-        await asyncio.sleep(1.0)
-        await self._ensure_connected()
-        LOGGER.info("%s: reconnected after mode change (%s)", self.name, self._brightness_mode)
 
     # ---------------------------------------------------------
     # Свойства
@@ -231,10 +267,6 @@ class BLEDOMInstance:
     # ---------------------------------------------------------
     # Подключение BLE
     # ---------------------------------------------------------
-    async def _delayed_connect(self):
-        await asyncio.sleep(3)
-        await self._ensure_connected()
-
     def _detect_model(self):
         for i, name in enumerate(NAME_ARRAY):
             if self._device.name and self._device.name.lower().startswith(name.lower()):
@@ -252,39 +284,111 @@ class BLEDOMInstance:
         self._turn_on_cmd = TURN_ON_CMD[0]
         self._turn_off_cmd = TURN_OFF_CMD[0]
 
+    @property
+    def is_connected(self) -> bool:
+        return bool(self._client and self._client.is_connected)
+
+    def _current_ble_device(self):
+        """The freshest BLEDevice HA knows for this address, so a reconnect
+        goes through whichever adapter currently hears the light."""
+        return async_ble_device_from_address(self._hass, self.address, connectable=True) or self._device
+
     async def _ensure_connected(self):
-        if self._client and self._client.is_connected:
+        """Connect if not connected. Raises on failure.
+
+        Callers queue on the lock, and each re-checks the link once it holds
+        the lock: without that re-check, every queued caller opened a new
+        connection and dropped the previous one still open, which leaked
+        Bluetooth connection slots and file descriptors.
+        """
+        if self.is_connected:
             return
         async with self._connect_lock:
+            if self.is_connected:
+                return
+            if self._stopping:
+                raise BleakNotFoundError(f"{self.name}: integration is stopping")
+            await self._disconnect_client()
+            self._device = self._current_ble_device()
+            client = await establish_connection(
+                BleakClientWithServiceCache,
+                self._device,
+                self.name,
+                self._disconnected,
+                max_attempts=CONNECT_ATTEMPTS,
+                cached_services=self._cached_services,
+            )
+            if self._stopping:
+                await client.disconnect()
+                raise BleakNotFoundError(f"{self.name}: integration is stopping")
+            self._client = client
+            self._connected_since = asyncio.get_running_loop().time()
+            self._cached_services = client.services
+            for ch in WRITE_CHARACTERISTIC_UUIDS:
+                c = client.services.get_characteristic(ch)
+                if c:
+                    self._write_uuid = c
+                    break
+            LOGGER.info("%s connected", self.name)
+
+    async def _disconnect_client(self):
+        """Close the current connection, if any, and forget it."""
+        client, self._client = self._client, None
+        if client is not None:
             try:
-                client = await establish_connection(
-                    BleakClientWithServiceCache,
-                    self._device,
-                    self._device.name,
-                    self._disconnected,
-                    cached_services=self._cached_services,
-                )
-                self._client = client
-                self._cached_services = client.services
-                for ch in WRITE_CHARACTERISTIC_UUIDS:
-                    c = client.services.get_characteristic(ch)
-                    if c:
-                        self._write_uuid = c
-                        break
-                LOGGER.info("%s connected", self._device.name)
-            except Exception as e:
-                LOGGER.error("%s: connection failed: %s", self._device.name, e)
-                await asyncio.sleep(5)
-                asyncio.create_task(self._ensure_connected())
+                await client.disconnect()
+            except Exception as err:  # already gone is fine
+                LOGGER.debug("%s: disconnect: %s", self.name, err)
 
     def _disconnected(self, _client):
-        asyncio.create_task(self._ensure_connected())
+        """Bleak callback: wake the connection loop, which reconnects."""
+        if not self._stopping:
+            self._hass.loop.call_soon_threadsafe(self._wake.set)
 
-    async def _heartbeat(self):
-        while True:
-            if not self._client or not self._client.is_connected:
-                await self._ensure_connected()
-            await asyncio.sleep(30)
+    async def _connection_loop(self):
+        """The only place that reconnects on its own. One per light.
+
+        Each attempt pushes the next allowed attempt out by the current
+        backoff and doubles it. The backoff resets only once a link has
+        stayed up for a full heartbeat, so a link that connects and drops
+        straight away is retried no faster than one that never connects.
+        """
+        loop = asyncio.get_running_loop()
+        await asyncio.sleep(INITIAL_CONNECT_DELAY_SECONDS)
+        backoff = RECONNECT_MIN_SECONDS
+        not_before = 0.0
+        failures = 0
+        while not self._stopping:
+            self._wake.clear()
+            now = loop.time()
+            if self.is_connected:
+                if self._connected_since is not None and now - self._connected_since >= HEARTBEAT_SECONDS:
+                    if failures:
+                        LOGGER.info("%s: link stable again after %d failed attempts", self.name, failures)
+                    failures, backoff = 0, RECONNECT_MIN_SECONDS
+                delay = HEARTBEAT_SECONDS
+            elif now < not_before:
+                delay = not_before - now
+            else:
+                try:
+                    await self._ensure_connected()
+                    delay = HEARTBEAT_SECONDS
+                except asyncio.CancelledError:
+                    raise
+                except Exception as err:
+                    failures += 1
+                    log = LOGGER.warning if failures == 1 else LOGGER.debug
+                    log("%s: connection failed (attempt %d), retrying in %ds: %s",
+                        self.name, failures, backoff, err)
+                    delay = backoff
+                # Counted from the end of the attempt: one attempt can take
+                # longer than the backoff itself.
+                not_before = loop.time() + backoff
+                backoff = min(backoff * 2, RECONNECT_MAX_SECONDS)
+            try:
+                await asyncio.wait_for(self._wake.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
 
     # ---------------------------------------------------------
     # BLE-команды
@@ -294,14 +398,12 @@ class BLEDOMInstance:
         await self._ensure_connected()
         await self._client.write_gatt_char(self._write_uuid, bytearray(data), False)
 
-    @retry_bluetooth_connection_error
     async def turn_on(self):
         await self._write(self._turn_on_cmd)
         await asyncio.sleep(0.2)
         await self.set_color(self._rgb_color, self._brightness)
         self._is_on = True
 
-    @retry_bluetooth_connection_error
     async def turn_off(self):
         await self._async_save_state()
         await self._write(self._turn_off_cmd)
@@ -328,7 +430,6 @@ class BLEDOMInstance:
         await self._write([0x7E, 0x07, 0x05, 0x01, val, 0x00, 0x00, 0x10, 0xEF])
         self._is_on = val > 0
 
-    @retry_bluetooth_connection_error
     async def set_brightness(self, value: int):
         self._brightness = max(1, min(int(value), 255))
         r, g, b = self._rgb_color
@@ -354,13 +455,14 @@ class BLEDOMInstance:
                 try:
                     await write_native_then_rgb()
                     LOGGER.debug("%s: brightness auto→native success (%s%%)", self.name, percent)
+                except CONNECTION_EXCEPTIONS:
+                    raise  # no link: the RGB fallback would fail the same way
                 except Exception as e:
                     LOGGER.warning("%s: native failed (%s), fallback to RGB: %s", self.name, percent, e)
                     await write_rgb_scaled()
         finally:
             await self._async_save_state()
 
-    @retry_bluetooth_connection_error
     async def set_color(self, rgb: Tuple[int, int, int], brightness: int | None = None):
         if brightness is not None:
             self._brightness = max(1, min(int(brightness), 255))
@@ -374,7 +476,6 @@ class BLEDOMInstance:
         self._is_on = True
         await self._async_save_state()
 
-    @retry_bluetooth_connection_error
     async def set_color_temp_kelvin(self, value: int, brightness: int | None = None):
         k_min, k_max = self._min_color_temp_kelvin, self._max_color_temp_kelvin
         k = max(k_min, min(int(value), k_max))
@@ -401,7 +502,6 @@ class BLEDOMInstance:
 
         await self.set_color((r, g, b), self._brightness)
 
-    @retry_bluetooth_connection_error
     async def set_effect(self, value: int):
         try:
             await self._ensure_connected()
@@ -414,13 +514,22 @@ class BLEDOMInstance:
         except Exception as e:
             LOGGER.error("%s: set_effect error: %s", self.name, e)
 
-    @retry_bluetooth_connection_error
     async def set_effect_speed(self, speed: int):
         s = max(1, min(int(speed), 31))
         self._effect_speed = s
         await self._write([0x7E, 0x00, 0x02, s, 0x03, 0x00, 0x00, 0x00, 0xEF])
 
     async def stop(self):
+        """End the connection loop and close the link. Safe to call twice
+        (unload and HA shutdown both call it)."""
+        self._stopping = True
+        self._wake.set()
+        self._loop_task.cancel()
+        # Let the saved state finish loading (a short file read) rather than
+        # cancel it: saving before it loads would overwrite it with defaults.
+        await asyncio.gather(self._loop_task, self._load_task, return_exceptions=True)
         await self._async_save_state()
-        if self._client and self._client.is_connected:
-            await self._client.disconnect()
+        # No lock: waiting here would hold up unload and shutdown behind a
+        # connect in progress, and that connect disconnects itself when it
+        # sees _stopping.
+        await self._disconnect_client()
