@@ -11,8 +11,10 @@ unreachable, and nothing left running after stop().
 
 import asyncio
 import importlib.util
+import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -186,6 +188,13 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.light = self.mod.BLEDOMInstance("BE:68:91:03:8B:17", False, 120, self.hass)
         return self.light
 
+    async def quiet_connection_loop(self, light):
+        """Stop the light's own reconnect loop, so a test counts only the
+        connection attempts its command makes."""
+        light._loop_task.cancel()
+        await asyncio.gather(light._loop_task, return_exceptions=True)
+        self.stack.attempts = 0
+
     def extra_tasks(self):
         return len(asyncio.all_tasks()) - self.baseline_tasks
 
@@ -232,10 +241,48 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_command_to_unreachable_light_tries_one_connection(self):
         light = self.make_light()
+        await self.quiet_connection_loop(light)
         self.stack.fail_next = 10**6
         with self.assertRaises(FakeOutOfSlots):
             await light.set_effect_speed(5)
         self.assertEqual(self.stack.attempts, 1, "establish_connection already retries")
+
+    async def test_auto_brightness_to_unreachable_light_tries_one_connection(self):
+        light = self.make_light()
+        await self.quiet_connection_loop(light)
+        self.stack.fail_next = 10**6
+        with self.assertRaises(FakeOutOfSlots):
+            await light.set_brightness(128)  # auto mode: native, then RGB fallback
+        self.assertEqual(self.stack.attempts, 1, "no RGB fallback without a link")
+
+    async def test_stop_right_after_setup_keeps_saved_state(self):
+        saved = {"rgb": [10, 20, 30], "brightness": 40, "color_temp": 3000, "brightness_mode": "rgb"}
+        Path(self.mod.STATE_FILE).write_text(json.dumps({"BE:68:91:03:8B:17": saved}))
+        light = self.make_light()
+        await light.stop()
+        del self.light
+        on_disk = json.loads(Path(self.mod.STATE_FILE).read_text())["BE:68:91:03:8B:17"]
+        self.assertEqual(on_disk["brightness_mode"], "rgb")
+        self.assertEqual(list(on_disk["rgb"]), [10, 20, 30])
+
+    async def test_concurrent_saves_from_two_lights_keep_both(self):
+        a, b = self.mod.BLEDOMInstance("AA:AA", False, 120, self.hass), self.make_light()
+        real_json = self.mod.json
+
+        def slow_dump(*args, **kwargs):  # widen the read-modify-write window
+            time.sleep(0.02)
+            return real_json.dump(*args, **kwargs)
+
+        self.mod.json = types.SimpleNamespace(
+            load=real_json.load, dump=slow_dump, JSONDecodeError=real_json.JSONDecodeError)
+        try:
+            await asyncio.gather(a._async_save_state({"n": 1}), b._async_save_state({"n": 2}))
+            on_disk = json.loads(Path(self.mod.STATE_FILE).read_text())
+            self.assertIn("AA:AA", on_disk)
+            self.assertIn("BE:68:91:03:8B:17", on_disk)
+        finally:
+            self.mod.json = real_json
+            await a.stop()
 
     async def test_brightness_mode_select_saves_mode_and_reloads(self):
         light = self.make_light()

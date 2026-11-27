@@ -2,6 +2,7 @@ import asyncio
 import logging
 import json
 import os
+import threading
 from typing import Tuple, TypeVar, Callable, cast, Any
 from bleak.backends.service import BleakGATTServiceCollection
 
@@ -81,6 +82,9 @@ RECONNECT_MIN_SECONDS = 5
 RECONNECT_MAX_SECONDS = 300
 CONNECT_ATTEMPTS = 3
 STATE_FILE = "/config/.storage/elkbledom_fastlink_state.json"
+# Every light reads, changes and rewrites the one state file from executor
+# threads; without the lock, two saves at once can drop one light's update.
+_STATE_FILE_LOCK = threading.Lock()
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError,)
 # establish_connection has already retried these; retrying them again per
 # write multiplied one command into minutes of connection attempts.
@@ -153,19 +157,21 @@ class BLEDOMInstance:
         self._connected_since: float | None = None
 
         self._detect_model()
-        self._tasks: list[asyncio.Task] = [
-            hass.async_create_background_task(
-                self._async_init_state(), f"elkbledom_fastlink {address} load state"
-            ),
-            hass.async_create_background_task(
-                self._connection_loop(), f"elkbledom_fastlink {address} connection"
-            ),
-        ]
+        self._load_task = hass.async_create_background_task(
+            self._async_init_state(), f"elkbledom_fastlink {address} load state"
+        )
+        self._loop_task = hass.async_create_background_task(
+            self._connection_loop(), f"elkbledom_fastlink {address} connection"
+        )
 
     # ---------------------------------------------------------
     # JSON-состояние (асинхронно)
     # ---------------------------------------------------------
     def _load_state_sync(self):
+        with _STATE_FILE_LOCK:
+            return self._load_state_locked()
+
+    def _load_state_locked(self):
         try:
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
             if os.path.exists(STATE_FILE):
@@ -180,6 +186,10 @@ class BLEDOMInstance:
         return await self._hass.async_add_executor_job(self._load_state_sync)
 
     def _save_state_sync(self, payload: dict | None = None):
+        with _STATE_FILE_LOCK:
+            self._save_state_locked(payload)
+
+    def _save_state_locked(self, payload: dict | None = None):
         try:
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
             data: dict = {}
@@ -514,10 +524,10 @@ class BLEDOMInstance:
         (unload and HA shutdown both call it)."""
         self._stopping = True
         self._wake.set()
-        for task in self._tasks:
-            task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
+        self._loop_task.cancel()
+        # Let the saved state finish loading (a short file read) rather than
+        # cancel it: saving before it loads would overwrite it with defaults.
+        await asyncio.gather(self._loop_task, self._load_task, return_exceptions=True)
         await self._async_save_state()
         # No lock: waiting here would hold up unload and shutdown behind a
         # connect in progress, and that connect disconnects itself when it
